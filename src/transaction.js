@@ -1,330 +1,452 @@
-var assert = require('assert')
-var bufferutils = require('./bufferutils')
-var crypto = require('./crypto')
-var opcodes = require('./opcodes')
-var scripts = require('./scripts')
-
-var Address = require('./address')
-var ECKey = require('./eckey')
-var ECSignature = require('./ecsignature')
-var Script = require('./script')
-
-Transaction.DEFAULT_SEQUENCE = 0xffffffff
-Transaction.SIGHASH_ALL = 0x01
-Transaction.SIGHASH_NONE = 0x02
-Transaction.SIGHASH_SINGLE = 0x03
-Transaction.SIGHASH_ANYONECANPAY = 0x80
-
-function Transaction() {
-  this.version = 1
-  this.locktime = 0
-  this.ins = []
-  this.outs = []
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const bufferutils = require("./bufferutils");
+const bufferutils_1 = require("./bufferutils");
+const bcrypto = require("./crypto");
+const bscript = require("./script");
+const script_1 = require("./script");
+const types = require("./types");
+const typeforce = require('typeforce');
+const varuint = require('varuint-bitcoin');
+function varSliceSize(someScript) {
+    const length = someScript.length;
+    return varuint.encodingLength(length) + length;
 }
-
-/**
- * Create a new txin.
- *
- * Can be called with any of:
- *
- * - A transaction and an index
- * - A transaction hash and an index
- *
- * Note that this method does not sign the created input.
- */
-Transaction.prototype.addInput = function(tx, index, sequence) {
-  if (sequence == undefined) sequence = Transaction.DEFAULT_SEQUENCE
-
-  var hash
-
-  if (typeof tx === 'string') {
-    hash = new Buffer(tx, 'hex')
-
-    // TxId hex is big-endian, we need little-endian
-    Array.prototype.reverse.call(hash)
-
-  } else if (tx instanceof Transaction) {
-    hash = tx.getHash()
-
-  } else {
-    hash = tx
-  }
-
-  assert(Buffer.isBuffer(hash), 'Expected Transaction, txId or txHash, got ' + tx)
-  assert.equal(hash.length, 32, 'Expected hash length of 32, got ' + hash.length)
-  assert.equal(typeof index, 'number', 'Expected number index, got ' + index)
-
-  return (this.ins.push({
-    hash: hash,
-    index: index,
-    script: Script.EMPTY,
-    sequence: sequence
-  }) - 1)
+function vectorSize(someVector) {
+    const length = someVector.length;
+    return (varuint.encodingLength(length) +
+        someVector.reduce((sum, witness) => {
+            return sum + varSliceSize(witness);
+        }, 0));
 }
-
-/**
- * Create a new txout.
- *
- * Can be called with:
- *
- * - A base58 address string and a value
- * - An Address object and a value
- * - A scriptPubKey Script and a value
- */
-Transaction.prototype.addOutput = function(scriptPubKey, value) {
-  // Attempt to get a valid address if it's a base58 address string
-  if (typeof scriptPubKey === 'string') {
-    scriptPubKey = Address.fromBase58Check(scriptPubKey)
-  }
-
-  // Attempt to get a valid script if it's an Address object
-  if (scriptPubKey instanceof Address) {
-    var address = scriptPubKey
-
-    scriptPubKey = address.toOutputScript()
-  }
-
-  return (this.outs.push({
-    script: scriptPubKey,
-    value: value,
-  }) - 1)
+const EMPTY_SCRIPT = Buffer.allocUnsafe(0);
+const EMPTY_WITNESS = [];
+const ZERO = Buffer.from('0000000000000000000000000000000000000000000000000000000000000000', 'hex');
+const ONE = Buffer.from('0000000000000000000000000000000000000000000000000000000000000001', 'hex');
+const VALUE_UINT64_MAX = Buffer.from('ffffffffffffffff', 'hex');
+const BLANK_OUTPUT = {
+    script: EMPTY_SCRIPT,
+    valueBuffer: VALUE_UINT64_MAX,
+};
+function isOutput(out) {
+    return out.value !== undefined;
 }
-
-Transaction.prototype.toBuffer = function () {
-  var txInSize = this.ins.reduce(function(a, x) {
-    return a + (40 + bufferutils.varIntSize(x.script.buffer.length) + x.script.buffer.length)
-  }, 0)
-
-  var txOutSize = this.outs.reduce(function(a, x) {
-    return a + (8 + bufferutils.varIntSize(x.script.buffer.length) + x.script.buffer.length)
-  }, 0)
-
-  var buffer = new Buffer(
-    8 +
-    bufferutils.varIntSize(this.ins.length) +
-    bufferutils.varIntSize(this.outs.length) +
-    txInSize +
-    txOutSize
-  )
-
-  var offset = 0
-  function writeSlice(slice) {
-    slice.copy(buffer, offset)
-    offset += slice.length
-  }
-  function writeUInt32(i) {
-    buffer.writeUInt32LE(i, offset)
-    offset += 4
-  }
-  function writeUInt64(i) {
-    bufferutils.writeUInt64LE(buffer, i, offset)
-    offset += 8
-  }
-  function writeVarInt(i) {
-    var n = bufferutils.writeVarInt(buffer, i, offset)
-    offset += n
-  }
-
-  writeUInt32(this.version)
-  writeVarInt(this.ins.length)
-
-  this.ins.forEach(function(txin) {
-    writeSlice(txin.hash)
-    writeUInt32(txin.index)
-    writeVarInt(txin.script.buffer.length)
-    writeSlice(txin.script.buffer)
-    writeUInt32(txin.sequence)
-  })
-
-  writeVarInt(this.outs.length)
-  this.outs.forEach(function(txout) {
-    writeUInt64(txout.value)
-    writeVarInt(txout.script.buffer.length)
-    writeSlice(txout.script.buffer)
-  })
-
-  writeUInt32(this.locktime)
-
-  return buffer
-}
-
-Transaction.prototype.toHex = function() {
-  return this.toBuffer().toString('hex')
-}
-
-/**
- * Hash transaction for signing a specific input.
- *
- * Bitcoin uses a different hash for each signed transaction input. This
- * method copies the transaction, makes the necessary changes based on the
- * hashType, serializes and finally hashes the result. This hash can then be
- * used to sign the transaction input in question.
- */
-Transaction.prototype.hashForSignature = function(prevOutScript, inIndex, hashType) {
-  assert(inIndex >= 0, 'Invalid vin index')
-  assert(inIndex < this.ins.length, 'Invalid vin index')
-  assert(prevOutScript instanceof Script, 'Invalid Script object')
-
-  var txTmp = this.clone()
-  var hashScript = prevOutScript.without(opcodes.OP_CODESEPARATOR)
-
-  // Blank out other inputs' signatures
-  txTmp.ins.forEach(function(txin) {
-    txin.script = Script.EMPTY
-  })
-  txTmp.ins[inIndex].script = hashScript
-
-  var hashTypeModifier = hashType & 0x1f
-  if (hashTypeModifier === Transaction.SIGHASH_NONE) {
-    assert(false, 'SIGHASH_NONE not yet supported')
-
-  } else if (hashTypeModifier === Transaction.SIGHASH_SINGLE) {
-    assert(false, 'SIGHASH_SINGLE not yet supported')
-
-  }
-
-  if (hashType & Transaction.SIGHASH_ANYONECANPAY) {
-    assert(false, 'SIGHASH_ANYONECANPAY not yet supported')
-  }
-
-  var hashTypeBuffer = new Buffer(4)
-  hashTypeBuffer.writeInt32LE(hashType, 0)
-
-  var buffer = Buffer.concat([txTmp.toBuffer(), hashTypeBuffer])
-  return crypto.hash256(buffer)
-}
-
-Transaction.prototype.getHash = function () {
-  return crypto.hash256(this.toBuffer())
-}
-
-Transaction.prototype.getId = function () {
-  var buffer = this.getHash()
-
-  // Big-endian is used for TxHash
-  Array.prototype.reverse.call(buffer)
-
-  return buffer.toString('hex')
-}
-
-Transaction.prototype.clone = function () {
-  var newTx = new Transaction()
-  newTx.version = this.version
-  newTx.locktime = this.locktime
-
-  newTx.ins = this.ins.map(function(txin) {
-    return {
-      hash: txin.hash,
-      index: txin.index,
-      script: txin.script,
-      sequence: txin.sequence
+class Transaction {
+    constructor() {
+        this.version = 1;
+        this.locktime = 0;
+        this.ins = [];
+        this.outs = [];
     }
-  })
-
-  newTx.outs = this.outs.map(function(txout) {
-    return {
-      script: txout.script,
-      value: txout.value
+    static fromBuffer(buffer, _NO_STRICT) {
+        let offset = 0;
+        function readSlice(n) {
+            offset += n;
+            return buffer.slice(offset - n, offset);
+        }
+        function readUInt32() {
+            const i = buffer.readUInt32LE(offset);
+            offset += 4;
+            return i;
+        }
+        function readInt32() {
+            const i = buffer.readInt32LE(offset);
+            offset += 4;
+            return i;
+        }
+        function readUInt64() {
+            const i = bufferutils.readUInt64LE(buffer, offset);
+            offset += 8;
+            return i;
+        }
+        function readVarInt() {
+            const vi = varuint.decode(buffer, offset);
+            offset += varuint.decode.bytes;
+            return vi;
+        }
+        function readVarSlice() {
+            return readSlice(readVarInt());
+        }
+        function readVector() {
+            const count = readVarInt();
+            const vector = [];
+            for (let i = 0; i < count; i++)
+                vector.push(readVarSlice());
+            return vector;
+        }
+        const tx = new Transaction();
+        tx.version = readInt32();
+        const marker = buffer.readUInt8(offset);
+        const flag = buffer.readUInt8(offset + 1);
+        let hasWitnesses = false;
+        if (marker === Transaction.ADVANCED_TRANSACTION_MARKER &&
+            flag === Transaction.ADVANCED_TRANSACTION_FLAG) {
+            offset += 2;
+            hasWitnesses = true;
+        }
+        const vinLen = readVarInt();
+        for (let i = 0; i < vinLen; ++i) {
+            tx.ins.push({
+                hash: readSlice(32),
+                index: readUInt32(),
+                script: readVarSlice(),
+                sequence: readUInt32(),
+                witness: EMPTY_WITNESS,
+            });
+        }
+        const voutLen = readVarInt();
+        for (let i = 0; i < voutLen; ++i) {
+            tx.outs.push({
+                value: readUInt64(),
+                script: readVarSlice(),
+            });
+        }
+        if (hasWitnesses) {
+            for (let i = 0; i < vinLen; ++i) {
+                tx.ins[i].witness = readVector();
+            }
+            // was this pointless?
+            if (!tx.hasWitnesses())
+                throw new Error('Transaction has superfluous witness data');
+        }
+        tx.locktime = readUInt32();
+        if (_NO_STRICT)
+            return tx;
+        if (offset !== buffer.length)
+            throw new Error('Transaction has unexpected data');
+        return tx;
     }
-  })
-
-  return newTx
+    static fromHex(hex) {
+        return Transaction.fromBuffer(Buffer.from(hex, 'hex'), false);
+    }
+    static isCoinbaseHash(buffer) {
+        typeforce(types.Hash256bit, buffer);
+        for (let i = 0; i < 32; ++i) {
+            if (buffer[i] !== 0)
+                return false;
+        }
+        return true;
+    }
+    isCoinbase() {
+        return (this.ins.length === 1 && Transaction.isCoinbaseHash(this.ins[0].hash));
+    }
+    addInput(hash, index, sequence, scriptSig) {
+        typeforce(types.tuple(types.Hash256bit, types.UInt32, types.maybe(types.UInt32), types.maybe(types.Buffer)), arguments);
+        if (types.Null(sequence)) {
+            sequence = Transaction.DEFAULT_SEQUENCE;
+        }
+        // Add the input and return the input's index
+        return (this.ins.push({
+            hash,
+            index,
+            script: scriptSig || EMPTY_SCRIPT,
+            sequence: sequence,
+            witness: EMPTY_WITNESS,
+        }) - 1);
+    }
+    addOutput(scriptPubKey, value) {
+        typeforce(types.tuple(types.Buffer, types.Satoshi), arguments);
+        // Add the output and return the output's index
+        return (this.outs.push({
+            script: scriptPubKey,
+            value,
+        }) - 1);
+    }
+    hasWitnesses() {
+        return this.ins.some(x => {
+            return x.witness.length !== 0;
+        });
+    }
+    weight() {
+        const base = this.__byteLength(false);
+        const total = this.__byteLength(true);
+        return base * 3 + total;
+    }
+    virtualSize() {
+        return Math.ceil(this.weight() / 4);
+    }
+    byteLength() {
+        return this.__byteLength(true);
+    }
+    clone() {
+        const newTx = new Transaction();
+        newTx.version = this.version;
+        newTx.locktime = this.locktime;
+        newTx.ins = this.ins.map(txIn => {
+            return {
+                hash: txIn.hash,
+                index: txIn.index,
+                script: txIn.script,
+                sequence: txIn.sequence,
+                witness: txIn.witness,
+            };
+        });
+        newTx.outs = this.outs.map(txOut => {
+            return {
+                script: txOut.script,
+                value: txOut.value,
+            };
+        });
+        return newTx;
+    }
+    /**
+     * Hash transaction for signing a specific input.
+     *
+     * Bitcoin uses a different hash for each signed transaction input.
+     * This method copies the transaction, makes the necessary changes based on the
+     * hashType, and then hashes the result.
+     * This hash can then be used to sign the provided transaction input.
+     */
+    hashForSignature(inIndex, prevOutScript, hashType) {
+        typeforce(types.tuple(types.UInt32, types.Buffer, /* types.UInt8 */ types.Number), arguments);
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/sighash_tests.cpp#L29
+        if (inIndex >= this.ins.length)
+            return ONE;
+        // ignore OP_CODESEPARATOR
+        const ourScript = bscript.compile(bscript.decompile(prevOutScript).filter(x => {
+            return x !== script_1.OPS.OP_CODESEPARATOR;
+        }));
+        const txTmp = this.clone();
+        // SIGHASH_NONE: ignore all outputs? (wildcard payee)
+        if ((hashType & 0x1f) === Transaction.SIGHASH_NONE) {
+            txTmp.outs = [];
+            // ignore sequence numbers (except at inIndex)
+            txTmp.ins.forEach((input, i) => {
+                if (i === inIndex)
+                    return;
+                input.sequence = 0;
+            });
+            // SIGHASH_SINGLE: ignore all outputs, except at the same index?
+        }
+        else if ((hashType & 0x1f) === Transaction.SIGHASH_SINGLE) {
+            // https://github.com/bitcoin/bitcoin/blob/master/src/test/sighash_tests.cpp#L60
+            if (inIndex >= this.outs.length)
+                return ONE;
+            // truncate outputs after
+            txTmp.outs.length = inIndex + 1;
+            // "blank" outputs before
+            for (let i = 0; i < inIndex; i++) {
+                txTmp.outs[i] = BLANK_OUTPUT;
+            }
+            // ignore sequence numbers (except at inIndex)
+            txTmp.ins.forEach((input, y) => {
+                if (y === inIndex)
+                    return;
+                input.sequence = 0;
+            });
+        }
+        // SIGHASH_ANYONECANPAY: ignore inputs entirely?
+        if (hashType & Transaction.SIGHASH_ANYONECANPAY) {
+            txTmp.ins = [txTmp.ins[inIndex]];
+            txTmp.ins[0].script = ourScript;
+            // SIGHASH_ALL: only ignore input scripts
+        }
+        else {
+            // "blank" others input scripts
+            txTmp.ins.forEach(input => {
+                input.script = EMPTY_SCRIPT;
+            });
+            txTmp.ins[inIndex].script = ourScript;
+        }
+        // serialize and hash
+        const buffer = Buffer.allocUnsafe(txTmp.__byteLength(false) + 4);
+        buffer.writeInt32LE(hashType, buffer.length - 4);
+        txTmp.__toBuffer(buffer, 0, false);
+        return bcrypto.hash256(buffer);
+    }
+    hashForWitnessV0(inIndex, prevOutScript, value, hashType) {
+        typeforce(types.tuple(types.UInt32, types.Buffer, types.Satoshi, types.UInt32), arguments);
+        let tbuffer = Buffer.from([]);
+        let toffset = 0;
+        function writeSlice(slice) {
+            toffset += slice.copy(tbuffer, toffset);
+        }
+        function writeUInt32(i) {
+            toffset = tbuffer.writeUInt32LE(i, toffset);
+        }
+        function writeUInt64(i) {
+            toffset = bufferutils.writeUInt64LE(tbuffer, i, toffset);
+        }
+        function writeVarInt(i) {
+            varuint.encode(i, tbuffer, toffset);
+            toffset += varuint.encode.bytes;
+        }
+        function writeVarSlice(slice) {
+            writeVarInt(slice.length);
+            writeSlice(slice);
+        }
+        let hashOutputs = ZERO;
+        let hashPrevouts = ZERO;
+        let hashSequence = ZERO;
+        if (!(hashType & Transaction.SIGHASH_ANYONECANPAY)) {
+            tbuffer = Buffer.allocUnsafe(36 * this.ins.length);
+            toffset = 0;
+            this.ins.forEach(txIn => {
+                writeSlice(txIn.hash);
+                writeUInt32(txIn.index);
+            });
+            hashPrevouts = bcrypto.hash256(tbuffer);
+        }
+        if (!(hashType & Transaction.SIGHASH_ANYONECANPAY) &&
+            (hashType & 0x1f) !== Transaction.SIGHASH_SINGLE &&
+            (hashType & 0x1f) !== Transaction.SIGHASH_NONE) {
+            tbuffer = Buffer.allocUnsafe(4 * this.ins.length);
+            toffset = 0;
+            this.ins.forEach(txIn => {
+                writeUInt32(txIn.sequence);
+            });
+            hashSequence = bcrypto.hash256(tbuffer);
+        }
+        if ((hashType & 0x1f) !== Transaction.SIGHASH_SINGLE &&
+            (hashType & 0x1f) !== Transaction.SIGHASH_NONE) {
+            const txOutsSize = this.outs.reduce((sum, output) => {
+                return sum + 8 + varSliceSize(output.script);
+            }, 0);
+            tbuffer = Buffer.allocUnsafe(txOutsSize);
+            toffset = 0;
+            this.outs.forEach(out => {
+                writeUInt64(out.value);
+                writeVarSlice(out.script);
+            });
+            hashOutputs = bcrypto.hash256(tbuffer);
+        }
+        else if ((hashType & 0x1f) === Transaction.SIGHASH_SINGLE &&
+            inIndex < this.outs.length) {
+            const output = this.outs[inIndex];
+            tbuffer = Buffer.allocUnsafe(8 + varSliceSize(output.script));
+            toffset = 0;
+            writeUInt64(output.value);
+            writeVarSlice(output.script);
+            hashOutputs = bcrypto.hash256(tbuffer);
+        }
+        tbuffer = Buffer.allocUnsafe(156 + varSliceSize(prevOutScript));
+        toffset = 0;
+        const input = this.ins[inIndex];
+        writeUInt32(this.version);
+        writeSlice(hashPrevouts);
+        writeSlice(hashSequence);
+        writeSlice(input.hash);
+        writeUInt32(input.index);
+        writeVarSlice(prevOutScript);
+        writeUInt64(value);
+        writeUInt32(input.sequence);
+        writeSlice(hashOutputs);
+        writeUInt32(this.locktime);
+        writeUInt32(hashType);
+        return bcrypto.hash256(tbuffer);
+    }
+    getHash(forWitness) {
+        // wtxid for coinbase is always 32 bytes of 0x00
+        if (forWitness && this.isCoinbase())
+            return Buffer.alloc(32, 0);
+        return bcrypto.hash256(this.__toBuffer(undefined, undefined, forWitness));
+    }
+    getId() {
+        // transaction hash's are displayed in reverse order
+        return bufferutils_1.reverseBuffer(this.getHash(false)).toString('hex');
+    }
+    toBuffer(buffer, initialOffset) {
+        return this.__toBuffer(buffer, initialOffset, true);
+    }
+    toHex() {
+        return this.toBuffer(undefined, undefined).toString('hex');
+    }
+    setInputScript(index, scriptSig) {
+        typeforce(types.tuple(types.Number, types.Buffer), arguments);
+        this.ins[index].script = scriptSig;
+    }
+    setWitness(index, witness) {
+        typeforce(types.tuple(types.Number, [types.Buffer]), arguments);
+        this.ins[index].witness = witness;
+    }
+    __byteLength(_ALLOW_WITNESS) {
+        const hasWitnesses = _ALLOW_WITNESS && this.hasWitnesses();
+        return ((hasWitnesses ? 10 : 8) +
+            varuint.encodingLength(this.ins.length) +
+            varuint.encodingLength(this.outs.length) +
+            this.ins.reduce((sum, input) => {
+                return sum + 40 + varSliceSize(input.script);
+            }, 0) +
+            this.outs.reduce((sum, output) => {
+                return sum + 8 + varSliceSize(output.script);
+            }, 0) +
+            (hasWitnesses
+                ? this.ins.reduce((sum, input) => {
+                    return sum + vectorSize(input.witness);
+                }, 0)
+                : 0));
+    }
+    __toBuffer(buffer, initialOffset, _ALLOW_WITNESS) {
+        if (!buffer)
+            buffer = Buffer.allocUnsafe(this.__byteLength(_ALLOW_WITNESS));
+        let offset = initialOffset || 0;
+        function writeSlice(slice) {
+            offset += slice.copy(buffer, offset);
+        }
+        function writeUInt8(i) {
+            offset = buffer.writeUInt8(i, offset);
+        }
+        function writeUInt32(i) {
+            offset = buffer.writeUInt32LE(i, offset);
+        }
+        function writeInt32(i) {
+            offset = buffer.writeInt32LE(i, offset);
+        }
+        function writeUInt64(i) {
+            offset = bufferutils.writeUInt64LE(buffer, i, offset);
+        }
+        function writeVarInt(i) {
+            varuint.encode(i, buffer, offset);
+            offset += varuint.encode.bytes;
+        }
+        function writeVarSlice(slice) {
+            writeVarInt(slice.length);
+            writeSlice(slice);
+        }
+        function writeVector(vector) {
+            writeVarInt(vector.length);
+            vector.forEach(writeVarSlice);
+        }
+        writeInt32(this.version);
+        const hasWitnesses = _ALLOW_WITNESS && this.hasWitnesses();
+        if (hasWitnesses) {
+            writeUInt8(Transaction.ADVANCED_TRANSACTION_MARKER);
+            writeUInt8(Transaction.ADVANCED_TRANSACTION_FLAG);
+        }
+        writeVarInt(this.ins.length);
+        this.ins.forEach(txIn => {
+            writeSlice(txIn.hash);
+            writeUInt32(txIn.index);
+            writeVarSlice(txIn.script);
+            writeUInt32(txIn.sequence);
+        });
+        writeVarInt(this.outs.length);
+        this.outs.forEach(txOut => {
+            if (isOutput(txOut)) {
+                writeUInt64(txOut.value);
+            }
+            else {
+                writeSlice(txOut.valueBuffer);
+            }
+            writeVarSlice(txOut.script);
+        });
+        if (hasWitnesses) {
+            this.ins.forEach(input => {
+                writeVector(input.witness);
+            });
+        }
+        writeUInt32(this.locktime);
+        // avoid slicing unless necessary
+        if (initialOffset !== undefined)
+            return buffer.slice(initialOffset, offset);
+        return buffer;
+    }
 }
-
-Transaction.fromBuffer = function(buffer) {
-  var offset = 0
-  function readSlice(n) {
-    offset += n
-    return buffer.slice(offset - n, offset)
-  }
-  function readUInt32() {
-    var i = buffer.readUInt32LE(offset)
-    offset += 4
-    return i
-  }
-  function readUInt64() {
-    var i = bufferutils.readUInt64LE(buffer, offset)
-    offset += 8
-    return i
-  }
-  function readVarInt() {
-    var vi = bufferutils.readVarInt(buffer, offset)
-    offset += vi.size
-    return vi.number
-  }
-
-  var tx = new Transaction()
-  tx.version = readUInt32()
-
-  var vinLen = readVarInt()
-  for (var i = 0; i < vinLen; ++i) {
-    var hash = readSlice(32)
-    var vout = readUInt32()
-    var scriptLen = readVarInt()
-    var script = readSlice(scriptLen)
-    var sequence = readUInt32()
-
-    tx.ins.push({
-      hash: hash,
-      index: vout,
-      script: Script.fromBuffer(script),
-      sequence: sequence
-    })
-  }
-
-  var voutLen = readVarInt()
-  for (i = 0; i < voutLen; ++i) {
-    var value = readUInt64()
-    var scriptLen = readVarInt()
-    var script = readSlice(scriptLen)
-
-    tx.outs.push({
-      value: value,
-      script: Script.fromBuffer(script)
-    })
-  }
-
-  tx.locktime = readUInt32()
-  assert.equal(offset, buffer.length, 'Transaction has unexpected data')
-
-  return tx
-}
-
-Transaction.fromHex = function(hex) {
-  return Transaction.fromBuffer(new Buffer(hex, 'hex'))
-}
-
-/**
- * Signs a pubKeyHash output at some index with the given key
- */
-Transaction.prototype.sign = function(index, privKey, hashType) {
-  var prevOutScript = privKey.pub.getAddress().toOutputScript()
-  var signature = this.signInput(index, prevOutScript, privKey, hashType)
-
-  // FIXME: Assumed prior TX was pay-to-pubkey-hash
-  var scriptSig = scripts.pubKeyHashInput(signature, privKey.pub)
-  this.setInputScript(index, scriptSig)
-}
-
-Transaction.prototype.signInput = function(index, prevOutScript, privKey, hashType) {
-  hashType = hashType || Transaction.SIGHASH_ALL
-
-  var hash = this.hashForSignature(prevOutScript, index, hashType)
-  var signature = privKey.sign(hash)
-
-  return signature.toScriptSignature(hashType)
-}
-
-Transaction.prototype.setInputScript = function(index, script) {
-  this.ins[index].script = script
-}
-
-// FIXME: could be validateInput(index, prevTxOut, pub)
-Transaction.prototype.validateInput = function(index, prevOutScript, pubKey, buffer) {
-  var parsed = ECSignature.parseScriptSignature(buffer)
-  var hash = this.hashForSignature(prevOutScript, index, parsed.hashType)
-
-  return pubKey.verify(hash, parsed.signature)
-}
-
-module.exports = Transaction
+Transaction.DEFAULT_SEQUENCE = 0xffffffff;
+Transaction.SIGHASH_ALL = 0x01;
+Transaction.SIGHASH_NONE = 0x02;
+Transaction.SIGHASH_SINGLE = 0x03;
+Transaction.SIGHASH_ANYONECANPAY = 0x80;
+Transaction.ADVANCED_TRANSACTION_MARKER = 0x00;
+Transaction.ADVANCED_TRANSACTION_FLAG = 0x01;
+exports.Transaction = Transaction;
