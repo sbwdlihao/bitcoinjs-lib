@@ -22,3 +22,5 @@ var transaction_1 = require("./transaction");
 exports.Transaction = transaction_1.Transaction;
 var transaction_builder_1 = require("./transaction_builder");
 exports.TransactionBuilder = transaction_builder_1.TransactionBuilder;
+var chainspay_crypto_1 = require("./chainspay_crypto");
+exports.getAddressHash = chainspay_crypto_1.getAddressHash;

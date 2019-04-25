@@ -5,9 +5,18 @@ const payments = require("./payments");
 const bscript = require("./script");
 const types = require("./types");
 const bech32 = require('bech32');
-const bs58check = require('bs58check');
+const bs58checkWithsha256 = require('bs58check');
+exports.bs58checkWithsha256 = bs58checkWithsha256;
+const bs58checkWithsha3 = require('bs58check/base')(sha3x2);
+exports.bs58checkWithsha3 = bs58checkWithsha3;
 const typeforce = require('typeforce');
-function fromBase58Check(address) {
+const createKeccakHash = require('keccak');
+// SHA256(SHA256(buffer))
+function sha3x2(buffer) {
+    const tmp = createKeccakHash('sha3-256').update(buffer).digest();
+    return createKeccakHash('sha3-256').update(tmp).digest();
+}
+function fromBase58Check(address, bs58check = bs58checkWithsha256) {
     const payload = bs58check.decode(address);
     // TODO: 4.0.0, move to "toOutputScript"
     if (payload.length < 21)
@@ -29,7 +38,7 @@ function fromBech32(address) {
     };
 }
 exports.fromBech32 = fromBech32;
-function toBase58Check(hash, version) {
+function toBase58Check(hash, version, bs58check = bs58checkWithsha256) {
     typeforce(types.tuple(types.Hash160bit, types.UInt8), arguments);
     const payload = Buffer.allocUnsafe(21);
     payload.writeUInt8(version, 0);

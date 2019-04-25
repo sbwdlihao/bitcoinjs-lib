@@ -5,8 +5,23 @@ import * as bscript from './script';
 import * as types from './types';
 
 const bech32 = require('bech32');
-const bs58check = require('bs58check');
+const bs58checkWithsha256 = require('bs58check');
+const bs58checkWithsha3 = require('bs58check/base')(sha3x2);
 const typeforce = require('typeforce');
+const createKeccakHash = require('keccak');
+
+export {bs58checkWithsha256, bs58checkWithsha3};
+
+export interface Base58Check {
+  decode: (arg: string) => Buffer;
+  encode: (arg: Buffer) => string;
+}
+
+// SHA3-256(SHA3-256(buffer))
+function sha3x2(buffer: Buffer): Buffer {
+  const tmp = createKeccakHash('sha3-256').update(buffer).digest();
+  return createKeccakHash('sha3-256').update(tmp).digest();
+}
 
 export interface Base58CheckResult {
   hash: Buffer;
@@ -19,7 +34,7 @@ export interface Bech32Result {
   data: Buffer;
 }
 
-export function fromBase58Check(address: string): Base58CheckResult {
+export function fromBase58Check(address: string, bs58check: Base58Check = bs58checkWithsha256): Base58CheckResult {
   const payload = bs58check.decode(address);
 
   // TODO: 4.0.0, move to "toOutputScript"
@@ -43,7 +58,7 @@ export function fromBech32(address: string): Bech32Result {
   };
 }
 
-export function toBase58Check(hash: Buffer, version: number): string {
+export function toBase58Check(hash: Buffer, version: number, bs58check: Base58Check = bs58checkWithsha256): string {
   typeforce(types.tuple(types.Hash160bit, types.UInt8), arguments);
 
   const payload = Buffer.allocUnsafe(21);
